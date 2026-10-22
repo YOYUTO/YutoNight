@@ -142,13 +142,113 @@ class DesktopWorkflowTests(unittest.TestCase):
         self.window._refresh_project()
         self.window.whisper_executable.clear()
         self.window.whisper_model.setText("D:/models/ggml-small.bin")
-        with patch.object(self.window, "_run_task") as run_task, patch("yutonight.ui.pipeline.transcribe", return_value=[]) as transcribe:
+        with patch.object(self.window, "_run_task") as run_task, patch("yutonight.ui.pipeline.transcribe_segments", return_value=iter([]), create=True) as transcribe:
             self.window.transcribe()
             self.assertEqual(run_task.call_count, 1)
             operation = run_task.call_args.args[1]
-            operation(lambda message: None)
+            list(operation(lambda message: None))
             self.assertEqual(transcribe.call_args.args[:3], ("D:/video.mp4", "", "D:/models/ggml-small.bin"))
         self.assertFalse(self.errors)
+
+    def test_segment_results_are_editable_and_saved_before_recognition_finishes(self):
+        first_visible, continue_second = threading.Event(), threading.Event()
+        self.window.whisper_model.setText("D:/fake-test-model.bin")
+        self.window.project = Project(video_path="D:/video.mp4")
+        self.window._refresh_project()
+        callback_threads = []
+        original_append = getattr(self.window, "_append_recognized", lambda cues: None)
+        def receive(cues):
+            callback_threads.append(QThread.currentThread() == self.app.thread())
+            original_append(cues)
+            first_visible.set()
+        def segments(*args, **kwargs):
+            yield [Cue("first", 0, 2, "おはよう")]
+            continue_second.wait(3)
+            yield [Cue("second", 30, 32, "こんにちは")]
+        try:
+            with patch("yutonight.ui.pipeline.transcribe_segments", side_effect=segments, create=True), patch.object(self.window, "_append_recognized", side_effect=receive):
+                self.window.transcribe()
+                deadline = time.monotonic() + 2
+                while not first_visible.is_set() and time.monotonic() < deadline:
+                    self.app.processEvents()
+                    time.sleep(0.01)
+                self.assertTrue(first_visible.is_set(), "首段未在识别完成前显示")
+                self.assertIsNotNone(self.window._thread)
+                self.assertTrue(self.window.table.isEnabled())
+                self.assertTrue(next(a for a in self.window._actions if a.text() == "保存项目").isEnabled())
+                self.assertFalse(self.window.settings_tabs.isEnabled())
+                self.window.table.item(0, 3).setText("早上好（人工校对）")
+                with tempfile.TemporaryDirectory() as directory:
+                    target = Path(directory) / "partial.json"
+                    with patch.object(QFileDialog, "getSaveFileName", return_value=(str(target), "")):
+                        self.assertTrue(self.window.save_project())
+                    self.assertEqual(load_project(target).cues[0].translation, "早上好（人工校对）")
+                continue_second.set()
+                self.wait_for_task()
+        finally:
+            continue_second.set()
+        self.assertEqual(callback_threads, [True, True])
+        self.assertEqual(len(self.window.project.cues), 2)
+        self.assertEqual(self.window.project.cues[0].translation, "早上好（人工校对）")
+        self.assertTrue(self.window.project.cues[0].reviewed)
+        self.assertTrue(self.window.dirty, "后续片段到达后应提示再次保存")
+        self.assertFalse(self.errors)
+
+    def test_segment_append_preserves_an_uncommitted_cell_editor(self):
+        from PySide6.QtTest import QTest
+        from PySide6.QtWidgets import QLineEdit
+        self.window.show()
+        self.window.activateWindow()
+        self.window.table.setFocus()
+        self.window.table.setCurrentCell(0, 3)
+        self.window.table.editItem(self.window.table.item(0, 3))
+        self.app.processEvents()
+        editor = self.window.table.findChild(QLineEdit)
+        self.assertIsNotNone(editor)
+        editor.setFocus()
+        self.app.processEvents()
+        self.assertTrue(editor.hasFocus())
+        editor.setText("尚未提交的校对")
+        self.window._append_recognized([Cue("second", 30, 32, "こんにちは")])
+        self.app.processEvents()
+        self.assertIs(self.window.table.findChild(QLineEdit), editor)
+        self.assertEqual(editor.text(), "尚未提交的校对")
+        self.assertTrue(editor.hasFocus())
+        QTest.keyClick(editor, Qt.Key.Key_Return)
+        self.app.processEvents()
+        self.assertEqual(self.window.project.cues[0].translation, "尚未提交的校对")
+        self.assertTrue(self.window.project.cues[0].reviewed)
+        self.assertEqual(len(self.window.project.cues), 2)
+
+    def test_later_segment_failure_keeps_completed_results(self):
+        self.window.whisper_model.setText("D:/fake-test-model.bin")
+        self.window.project = Project(video_path="D:/video.mp4")
+        def segments(*args, **kwargs):
+            yield [Cue("first", 0, 2, "おはよう")]
+            raise RuntimeError("第二段失败")
+        with patch("yutonight.ui.pipeline.transcribe_segments", side_effect=segments, create=True):
+            self.window.transcribe()
+            self.wait_for_task()
+        self.assertEqual([c.id for c in self.window.project.cues], ["first"])
+        self.assertEqual(self.errors, ["第二段失败"])
+        self.assertTrue(self.window.dirty)
+        self.assertTrue(self.window.table.isEnabled())
+
+    def test_failure_before_first_speech_preserves_previous_corrections(self):
+        from PySide6.QtWidgets import QMessageBox
+        self.window.whisper_model.setText("D:/fake-test-model.bin")
+        self.window.project.video_path = "D:/video.mp4"
+        self.window.project.cues[0].reviewed = True
+        def segments(*args, **kwargs):
+            yield []
+            raise RuntimeError("识别失败")
+        with patch("yutonight.ui.pipeline.transcribe_segments", side_effect=segments, create=True), patch.object(QMessageBox, "question", return_value=QMessageBox.StandardButton.Yes):
+            self.window.transcribe()
+            self.wait_for_task()
+        self.assertEqual(self.window.project.cues[0].id, "one")
+        self.assertTrue(self.window.project.cues[0].reviewed)
+        self.assertFalse(self.window.dirty)
+        self.assertEqual(self.errors, ["识别失败"])
 
     def test_transcribe_requires_a_model(self):
         self.window.project = Project(video_path="D:/video.mp4")
