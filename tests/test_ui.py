@@ -152,6 +152,7 @@ class DesktopWorkflowTests(unittest.TestCase):
 
     def test_segment_results_are_editable_and_saved_before_recognition_finishes(self):
         first_visible, continue_second = threading.Event(), threading.Event()
+        self.window.whisper_model.setText("D:/fake-test-model.bin")
         self.window.project = Project(video_path="D:/video.mp4")
         self.window._refresh_project()
         callback_threads = []
@@ -220,6 +221,7 @@ class DesktopWorkflowTests(unittest.TestCase):
         self.assertEqual(len(self.window.project.cues), 2)
 
     def test_later_segment_failure_keeps_completed_results(self):
+        self.window.whisper_model.setText("D:/fake-test-model.bin")
         self.window.project = Project(video_path="D:/video.mp4")
         def segments(*args, **kwargs):
             yield [Cue("first", 0, 2, "おはよう")]
@@ -234,6 +236,7 @@ class DesktopWorkflowTests(unittest.TestCase):
 
     def test_failure_before_first_speech_preserves_previous_corrections(self):
         from PySide6.QtWidgets import QMessageBox
+        self.window.whisper_model.setText("D:/fake-test-model.bin")
         self.window.project.video_path = "D:/video.mp4"
         self.window.project.cues[0].reviewed = True
         def segments(*args, **kwargs):
@@ -245,6 +248,7 @@ class DesktopWorkflowTests(unittest.TestCase):
         self.assertEqual(self.window.project.cues[0].id, "one")
         self.assertTrue(self.window.project.cues[0].reviewed)
         self.assertFalse(self.window.dirty)
+        self.assertEqual(self.errors, ["识别失败"])
 
     def test_transcribe_requires_a_model(self):
         self.window.project = Project(video_path="D:/video.mp4")
