@@ -12,7 +12,10 @@ from pathlib import Path
 import shutil
 import subprocess
 import tempfile
+import wave
 from urllib import error, parse, request
+
+import numpy as np
 
 from .core import Cue, parse_srt, format_srt, validate_project
 from . import paths
@@ -65,8 +68,7 @@ def probe_video(path: str) -> dict:
         raise PipelineError("无法读取视频信息，或文件中没有有效视频轨道。") from None
 
 
-def transcribe(video_path: str, executable: str, model_path: str,
-               progress=lambda message: None) -> list[Cue]:
+def _asr_tools(video_path: str, executable: str, model_path: str) -> str:
     if not Path(video_path).is_file():
         raise PipelineError("视频文件不存在。")
     if executable and not Path(executable).is_file():
@@ -78,43 +80,134 @@ def transcribe(video_path: str, executable: str, model_path: str,
         help_text = _run([ffmpeg, "-hide_banner", "-h", "filter=whisper"], capture=True, timeout=30)
         if "whisper AVOptions" not in help_text:
             raise PipelineError("当前 FFmpeg 未内置 whisper 滤镜，请选择 whisper-cli.exe 或安装带 whisper 的 FFmpeg。")
+    return ffmpeg
+
+
+def _link_asr_model(model_path: str, temporary: str, progress):
+    # Relative names also support whisper-cli's Windows filename handling.
+    linked_model = Path(temporary) / "model.bin"
+    try:
+        os.link(Path(model_path).resolve(), linked_model)
+    except OSError:
+        progress("正在准备识别模型的临时副本…")
+        shutil.copyfile(Path(model_path).resolve(), linked_model)
+
+
+def _recognize_audio(ffmpeg: str, executable: str, temporary: str) -> list[Cue]:
+    result_file = Path(temporary) / "recognized.srt"
+    result_file.unlink(missing_ok=True)
+    if executable:
+        _run([str(Path(executable).resolve()), "-m", "model.bin",
+              "-f", "audio.wav", "-l", "ja", "-osrt", "-of", "recognized"], cwd=temporary)
+    else:
+        _run([ffmpeg, "-hide_banner", "-loglevel", "error", "-nostdin", "-y", "-i", "audio.wav",
+              "-af", "whisper=model=model.bin:language=ja:queue=15:use_gpu=false:destination=recognized.srt:format=srt",
+              "-f", "null", "-"], cwd=temporary)
+    if not result_file.is_file():
+        raise PipelineError("识别工具没有生成 SRT，请检查音轨和模型兼容性。")
+    try:
+        return parse_srt(result_file.read_text(encoding="utf-8-sig"))
+    except (ValueError, UnicodeError):
+        raise PipelineError("识别结果的字幕格式无效。") from None
+
+
+def transcribe(video_path: str, executable: str, model_path: str,
+               progress=lambda message: None) -> list[Cue]:
+    ffmpeg = _asr_tools(video_path, executable, model_path)
     work_root = paths.PROJECT_ROOT / "work"
     work_root.mkdir(exist_ok=True)
     with tempfile.TemporaryDirectory(prefix="asr-", dir=work_root) as temporary:
         audio = str(Path(temporary) / "audio.wav")
-        prefix = str(Path(temporary) / "recognized")
         progress("正在提取音轨…")
         _run([ffmpeg, "-hide_banner", "-loglevel", "error", "-nostdin", "-y",
               "-i", str(Path(video_path).resolve()), "-vn", "-ac", "1", "-ar", "16000",
               "-c:a", "pcm_s16le", audio])
-        # Fixed relative paths support whisper-cli's Windows filename handling
-        # and avoid interpreting user paths as FFmpeg filter syntax.
-        linked_model = Path(temporary) / "model.bin"
-        try:
-            os.link(Path(model_path).resolve(), linked_model)
-        except OSError:
-            progress("正在准备识别模型的临时副本…")
-            shutil.copyfile(Path(model_path).resolve(), linked_model)
-        if executable:
-            progress("正在用 whisper.cpp 本地识别日语…")
-            _run([str(Path(executable).resolve()), "-m", "model.bin",
-                  "-f", "audio.wav", "-l", "ja", "-osrt", "-of", "recognized"], cwd=temporary)
-        else:
-            progress("正在用 FFmpeg Whisper CPU 基线识别日语，尚未启用 GPU 加速…")
-            _run([ffmpeg, "-hide_banner", "-loglevel", "error", "-nostdin", "-y", "-i", audio,
-                  "-af", "whisper=model=model.bin:language=ja:queue=15:use_gpu=false:destination=recognized.srt:format=srt",
-                  "-f", "null", "-"], cwd=temporary)
-        result_file = Path(prefix + ".srt")
-        if not result_file.is_file():
-            raise PipelineError("识别工具没有生成 SRT，请检查音轨和模型兼容性。")
-        try:
-            cues = parse_srt(result_file.read_text(encoding="utf-8-sig"))
-        except (ValueError, UnicodeError):
-            raise PipelineError("识别结果的字幕格式无效。") from None
+        _link_asr_model(model_path, temporary, progress)
+        progress("正在本地识别日语（CPU）…")
+        cues = _recognize_audio(ffmpeg, executable, temporary)
         if not cues:
             raise PipelineError("未识别到对白。请检查音轨或尝试其他模型。")
         progress(f"识别完成，共 {len(cues)} 条字幕。")
         return cues
+
+
+def _trim_asr_segment(audio: Path, target: float, remaining: float) -> tuple[float, bool]:
+    """Choose nearby silence, then trim the lookahead before recognition."""
+    with wave.open(str(audio), "rb") as source:
+        params = source.getparams()
+        frames = source.readframes(source.getnframes())
+    rate = params.framerate
+    boundary = min(target, remaining)
+    if remaining <= target + 2:
+        boundary = remaining
+    elif frames:
+        samples = np.frombuffer(frames, dtype="<i2").astype(np.float32)
+        step = max(1, round(rate * .02))
+        first = max(0, round((target - 2) * rate / step))
+        last = min(len(samples) // step, round((target + 2) * rate / step))
+        quiet_start = None
+        candidates = []
+        for block in range(first, last + 1):
+            quiet = block < last and np.mean(samples[block * step:(block + 1) * step] ** 2) < (32768 * 10 ** (-35 / 20)) ** 2
+            if quiet and quiet_start is None:
+                quiet_start = block
+            elif not quiet and quiet_start is not None:
+                if (block - quiet_start) * step / rate >= .3:
+                    candidates.append((quiet_start + block) * step / (2 * rate))
+                quiet_start = None
+        if candidates:
+            boundary = min(candidates, key=lambda value: abs(value - target))
+    count = round(boundary * rate)
+    with wave.open(str(audio), "wb") as destination:
+        destination.setparams(params)
+        destination.writeframes(frames[:count * params.sampwidth * params.nchannels])
+    return count / rate, bool(frames)
+
+
+def transcribe_segments(video_path: str, executable: str, model_path: str,
+                        progress=lambda message: None, *, segment_seconds: float = 30):
+    """Yield each completed segment; emitted cues are never revised afterwards.
+
+    Prefer a >=300 ms quiet interval within two seconds of the target boundary.
+    Continuous speech falls back to a hard cut; no fuzzy text deduplication is used.
+    """
+    if not math.isfinite(segment_seconds) or segment_seconds < 5:
+        raise PipelineError("识别分段长度必须至少为 5 秒。")
+    ffmpeg = _asr_tools(video_path, executable, model_path)
+    info = probe_video(video_path)
+    if not info["has_audio"]:
+        raise PipelineError("视频中没有音轨，无法识别对白。")
+    duration = info["duration"]
+    work_root = paths.PROJECT_ROOT / "work"
+    work_root.mkdir(exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix="asr-", dir=work_root) as temporary:
+        _link_asr_model(model_path, temporary, progress)
+        start, count, segment = 0.0, 0, 0
+        while start < duration - .001:
+            segment += 1
+            remaining = duration - start
+            progress(f"正在提取第 {segment} 段音轨（{start:.1f} / {duration:.1f} 秒）…")
+            audio = Path(temporary) / "audio.wav"
+            _run([ffmpeg, "-hide_banner", "-loglevel", "error", "-nostdin", "-y",
+                  "-ss", str(start), "-i", str(Path(video_path).resolve()),
+                  "-t", str(min(segment_seconds + 2, remaining)), "-vn", "-ac", "1", "-ar", "16000",
+                  "-c:a", "pcm_s16le", str(audio)])
+            length, has_samples = _trim_asr_segment(audio, segment_seconds, remaining)
+            end = min(duration, start + length)
+            progress(f"正在识别第 {segment} 段（日语 / CPU，{start:.1f}–{end:.1f} 秒）…")
+            cues = _recognize_audio(ffmpeg, executable, temporary) if has_samples else []
+            completed = []
+            for cue in cues:
+                cue.start, cue.end = max(start, start + cue.start), min(end, start + cue.end)
+                if cue.end > cue.start:
+                    count += 1
+                    cue.id = f"asr-{count:06d}"
+                    completed.append(cue)
+            progress(f"已完成 {end:.1f} / {duration:.1f} 秒，共 {count} 条字幕；可修改和保存已完成结果。")
+            yield completed
+            start = end
+        if not count:
+            raise PipelineError("未识别到对白。请检查音轨或尝试其他模型。")
 
 
 def _endpoint(provider: str, base_url: str) -> str:

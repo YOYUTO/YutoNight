@@ -50,17 +50,24 @@ def _seconds(text: str) -> float:
 class _Worker(QObject):
     message = Signal(str)
     succeeded = Signal(object)
+    partial = Signal(object)
     failed = Signal(str)
     finished = Signal()
 
-    def __init__(self, operation):
+    def __init__(self, operation, streaming=False):
         super().__init__()
         self.operation = operation
+        self.streaming = streaming
 
     @Slot()
     def run(self):
         try:
-            self.succeeded.emit(self.operation(self.message.emit))
+            result = self.operation(self.message.emit)
+            if self.streaming:
+                for batch in result:
+                    self.partial.emit(batch)
+                result = None
+            self.succeeded.emit(result)
         except Exception as error:
             self.failed.emit(str(error))
         finally:
@@ -79,6 +86,8 @@ class MainWindow(QMainWindow):
         self._thread = None
         self._worker = None
         self._task_callback = None
+        self._partial_callback = None
+        self._recognition_replacing = False
         self._busy_widgets = []
         self._actions = []
         self._build_ui()
@@ -97,6 +106,8 @@ class MainWindow(QMainWindow):
             action.triggered.connect(callback)
             toolbar.addAction(action)
             self._actions.append(action)
+            if callback == self.save_project:
+                self._save_action = action
         self.video_path_label = QLabel("尚未导入视频")
         self.video_path_label.setTextFormat(Qt.TextFormat.PlainText)
         self.video_path_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
@@ -200,9 +211,12 @@ class MainWindow(QMainWindow):
                 break
         form.addRow("识别程序", self._path_field(self.whisper_executable, "选择 whisper.cpp 程序"))
         form.addRow("识别模型", self._path_field(self.whisper_model, "选择识别模型"))
-        self.transcribe_button = QPushButton("识别日语字幕")
+        self.transcribe_button = QPushButton("分段识别日语字幕")
         self.transcribe_button.clicked.connect(self.transcribe)
         form.addRow(self.transcribe_button)
+        recognition_hint = QLabel("每段完成后显示字幕，可边播放边校对、保存；识别结束后可批量翻译。")
+        recognition_hint.setWordWrap(True)
+        form.addRow(recognition_hint)
         layout.addWidget(group)
         group = QGroupBox("翻译")
         form = QFormLayout(group)
@@ -353,12 +367,7 @@ class MainWindow(QMainWindow):
             self.video_path_label.setText(self.project.video_path or "尚未导入视频")
             self.table.setRowCount(len(self.project.cues))
             for row, cue in enumerate(self.project.cues):
-                for column, text in enumerate((_time_text(cue.start), _time_text(cue.end), cue.source, cue.translation)):
-                    self.table.setItem(row, column, QTableWidgetItem(text))
-                item = QTableWidgetItem()
-                item.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable | Qt.ItemFlag.ItemIsUserCheckable)
-                item.setCheckState(Qt.CheckState.Checked if cue.reviewed else Qt.CheckState.Unchecked)
-                self.table.setItem(row, 4, item)
+                self._write_cue_row(row, cue)
             self.table.resizeRowsToContents()
             settings = self.project.beauty
             self.beauty_enabled.setChecked(bool(settings.get("enabled", False)))
@@ -370,6 +379,14 @@ class MainWindow(QMainWindow):
             self._update_title()
         finally:
             self._loading = False
+
+    def _write_cue_row(self, row, cue):
+        for column, text in enumerate((_time_text(cue.start), _time_text(cue.end), cue.source, cue.translation)):
+            self.table.setItem(row, column, QTableWidgetItem(text))
+        item = QTableWidgetItem()
+        item.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable | Qt.ItemFlag.ItemIsUserCheckable)
+        item.setCheckState(Qt.CheckState.Checked if cue.reviewed else Qt.CheckState.Unchecked)
+        self.table.setItem(row, 4, item)
 
     def _refresh_regions(self):
         self.region_combo.clear()
@@ -562,7 +579,7 @@ class MainWindow(QMainWindow):
         self.model_name.setPlaceholderText("填写已安装的本地模型名称" if provider == "ollama" else "翻译模型名称")
         self._active_provider = provider
 
-    def _run_task(self, title, operation, on_success):
+    def _run_task(self, title, operation, on_success, *, on_partial=None):
         if self._thread is not None:
             return
         self.player.pause()
@@ -570,20 +587,30 @@ class MainWindow(QMainWindow):
             widget.setEnabled(False)
         for action in self._actions:
             action.setEnabled(False)
+        if on_partial is not None:
+            self.table.setEnabled(True)
+            self._save_action.setEnabled(True)
         self.statusBar().showMessage(title)
         self._thread = QThread(self)
-        self._worker = _Worker(operation)
+        self._worker = _Worker(operation, streaming=on_partial is not None)
         self._worker.moveToThread(self._thread)
         self._thread.started.connect(self._worker.run)
         self._worker.message.connect(self.statusBar().showMessage)
         self._task_callback = on_success
+        self._partial_callback = on_partial
+        self._worker.partial.connect(self._task_partial)
         self._worker.succeeded.connect(self._task_succeeded)
-        self._worker.failed.connect(self._error)
+        self._worker.failed.connect(self._task_failed)
         self._worker.finished.connect(self._thread.quit)
         self._worker.finished.connect(self._worker.deleteLater)
         self._thread.finished.connect(self._task_finished)
         self._thread.finished.connect(self._thread.deleteLater)
         self._thread.start()
+
+    @Slot(object)
+    def _task_partial(self, result):
+        if self._partial_callback is not None:
+            self._partial_callback(result)
 
     @Slot(object)
     def _task_succeeded(self, result):
@@ -593,27 +620,61 @@ class MainWindow(QMainWindow):
         except Exception as error:
             self._error(str(error))
 
+    @Slot(str)
+    def _task_failed(self, message):
+        if self._partial_callback is not None:
+            self.statusBar().showMessage("识别中断；现有字幕及人工修改已保留，可保存项目。")
+        self._error(message)
+
     @Slot()
     def _task_finished(self):
         self._thread.wait()
         self._thread = None
         self._worker = None
         self._task_callback = None
+        self._partial_callback = None
         for widget in self._busy_widgets:
             widget.setEnabled(True)
         for action in self._actions:
             action.setEnabled(True)
 
     def transcribe(self):
+        if self._thread is not None:
+            return
         if not self.project.video_path:
             return self._error("请先导入视频。")
         if not self.whisper_model.text().strip():
             return self._error("未找到识别模型。请复制完整的 models 文件夹，或手动选择本地模型；程序路径可留空，使用 FFmpeg 内置识别（CPU）。")
-        if self.project.cues and QMessageBox.question(self, "重新识别", "重新识别会替换现有字幕及校对内容，是否继续？") != QMessageBox.StandardButton.Yes:
+        if self.project.cues and QMessageBox.question(self, "重新识别", "首次识别出对白后，会替换现有字幕及校对内容。请先保存需要保留的项目。是否继续？") != QMessageBox.StandardButton.Yes:
             return
         video = self.project.video_path
         executable, model = self.whisper_executable.text().strip(), self.whisper_model.text().strip()
-        self._run_task("正在识别日语…", lambda progress: pipeline.transcribe(video, executable, model, progress=progress), self._accept_cues)
+        self._recognition_replacing = True
+        self._run_task("正在分段识别日语…", lambda progress: pipeline.transcribe_segments(video, executable, model, progress=progress), self._recognition_complete, on_partial=self._append_recognized)
+
+    def _append_recognized(self, cues):
+        if not cues:
+            return
+        self._loading = True
+        try:
+            if self._recognition_replacing:
+                self.project.cues = []
+                self.table.setRowCount(0)
+                self._recognition_replacing = False
+            first_row = len(self.project.cues)
+            self.project.cues.extend(cues)
+            self.table.setRowCount(len(self.project.cues))
+            # Append only: do not replace existing cells or an active edit widget.
+            for row in range(first_row, len(self.project.cues)):
+                self._write_cue_row(row, self.project.cues[row])
+                self.table.resizeRowToContents(row)
+        finally:
+            self._loading = False
+        self._set_dirty()
+        self._position_changed(self.player.position())
+
+    def _recognition_complete(self, result):
+        self.statusBar().showMessage(f"识别完成，共 {len(self.project.cues)} 条字幕；请翻译、校对后保存。")
 
     def _accept_cues(self, cues):
         self.project.cues = cues
