@@ -1,0 +1,10 @@
+{
+  "Qwen3-4B-Apache-2.0.txt": "https://huggingface.co/Qwen/Qwen3-4B/raw/main/LICENSE",
+  "Whisper-MIT.txt": "https://raw.githubusercontent.com/openai/whisper/main/LICENSE",
+  "llama.cpp-MIT.txt": "https://raw.githubusercontent.com/ggml-org/llama.cpp/b11804/LICENSE",
+  "Qt-LGPL-3.0-only.txt": "https://raw.githubusercontent.com/qt/qtbase/v6.12.0/LICENSES/LGPL-3.0-only.txt",
+  "Qt-GPL-3.0-only.txt": "https://raw.githubusercontent.com/qt/qtbase/v6.12.0/LICENSES/GPL-3.0-only.txt",
+  "whisper.cpp-MIT.txt": "https://raw.githubusercontent.com/ggml-org/whisper.cpp/v1.8.3/LICENSE",
+  "GPL-3.0.txt": "https://raw.githubusercontent.com/FFmpeg/FFmpeg/n9.0/COPYING.GPLv3",
+  "LGPL-2.1.txt": "https://raw.githubusercontent.com/FFmpeg/FFmpeg/n9.0/COPYING.LGPLv2.1"
+}
