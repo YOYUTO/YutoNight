@@ -49,7 +49,7 @@ def main():
     for p in sorted(files):
         manifest['files'].append({'path': p.relative_to(ROOT).as_posix(),
                                   'bytes': p.stat().st_size, 'sha256': sha256(p)})
-    for expected in json.loads((ROOT/'asset-manifest.json', 'AGENTS.md', 'CONTRIBUTING.md', '.gitignore', '.gitattributes').read_text(encoding='utf8')):
+    for expected in json.loads((ROOT/'asset-manifest.json').read_text(encoding='utf8')):
         if expected['name'].endswith('-model'):
             entry = next(item for item in manifest['files'] if item['path'] == expected['path'])
             if entry['sha256'] != expected['sha256']:
