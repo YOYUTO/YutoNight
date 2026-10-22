@@ -235,7 +235,7 @@ class MainWindow(QMainWindow):
         self.translate_button = QPushButton("翻译未校对字幕")
         self.translate_button.clicked.connect(self.translate)
         form.addRow(self.translate_button)
-        notice = QLabel("项目内模式自动启动随附模型，运行时不会下载模型，无需安装 Ollama。\n本地模式仅连接本机；DeepSeek 仅发送字幕文本及术语上下文。\n已校对条目会保留；未校对条目的现有译文可能被覆盖。\nAPI Key 不写入项目文件。")
+        notice = QLabel("项目内模式自动启动随附模型，运行时不会下载模型，无需安装 Ollama。\n本地模式仅连接本机；DeepSeek 仅发送字幕文本及术语上下文。\n已校对条目会保留；未校对条目的现有译文可能被覆盖。\n翻译按片段检查回传完整性，句内语义仍需人工校对。\nAPI Key 不写入项目文件。")
         notice.setWordWrap(True)
         form.addRow(notice)
         layout.addWidget(group)
