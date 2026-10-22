@@ -68,6 +68,101 @@ class PipelineTests(unittest.TestCase):
             thread.join()
 
 
+    def test_omitted_opening_fragment_is_rejected_without_changing_original(self):
+        source = "黒く焼け焦げた大地 本来は豊かな植物や希少な動物たちに恵まれた土地でした"
+        cues = [Cue("first", .92, 9.4, source, "原有译文")]
+        def chat(endpoint, payload, key):
+            targets = json.loads(payload["messages"][1]["content"])["targets"]
+            # Replay a response that contains only the latter part of the cue.
+            rows = [{"id": targets[-1]["id"], "text": "这片土地原本是肥沃的，孕育着丰富的植物和稀有动物"}]
+            return {"choices": [{"message": {"content": json.dumps({"translations": rows})}}]}
+        @contextmanager
+        def managed(progress):
+            yield "http://127.0.0.1:12345"
+        with patch("yutonight.pipeline.managed_translation_server", side_effect=managed), patch("yutonight.pipeline._chat", side_effect=chat):
+            with self.assertRaises(PipelineError):
+                translate_cues(cues, "bundled", "")
+        self.assertEqual(cues[0].translation, "原有译文")
+
+    def test_opening_fragment_and_following_clause_both_reach_translation(self):
+        source = "黒く焼け焦げた大地 本来は豊かな植物や希少な動物たちに恵まれた土地でした"
+        cues = [Cue("first", .92, 9.4, source), Cue("reviewed", 9.4, 10, "こんにちは", "人工校对", True)]
+        def chat(endpoint, payload, key):
+            targets = json.loads(payload["messages"][1]["content"])["targets"]
+            self.assertEqual([item["source"] for item in targets], ["黒く焼け焦げた大地", "本来は豊かな植物や希少な動物たちに恵まれた土地でした"])
+            self.assertTrue(all(item["full_source"] == source for item in targets))
+            rows = [{"id": target["id"], "text": text} for target, text in zip(targets, ["被烧得焦黑的大地", "这里原本孕育着丰富的植物和稀有动物。"])]
+            return {"message": {"content": json.dumps({"translations": rows})}}
+        with patch("yutonight.pipeline._chat", side_effect=chat):
+            result = translate_cues(cues, "ollama", "test")
+        self.assertEqual(result[0].translation, "被烧得焦黑的大地 这里原本孕育着丰富的植物和稀有动物。")
+        self.assertEqual((result[0].id, result[0].start, result[0].end, result[0].source), ("first", .92, 9.4, source))
+        self.assertEqual(result[1].translation, "人工校对")
+        self.assertEqual(cues[0].translation, "")
+
+    def test_short_word_spaces_and_latin_names_stay_in_one_target(self):
+        for source in ("これは テストです", "長い説明を始めます Alice Smithに会いました"):
+            with self.subTest(source=source):
+                def chat(endpoint, payload, key):
+                    targets = json.loads(payload["messages"][1]["content"])["targets"]
+                    self.assertEqual(targets, [{"id": "0", "source": source}])
+                    return {"message": {"content": json.dumps({"translations": [{"id": "0", "text": "完整译文"}]})}}
+                with patch("yutonight.pipeline._chat", side_effect=chat) as mocked:
+                    result = translate_cues([Cue("cue", 1, 2, source)], "ollama", "test")
+                self.assertEqual(mocked.call_count, 1)
+                self.assertEqual(result[0].translation, "完整译文")
+
+    def test_sentence_punctuation_and_newline_keep_fragment_order(self):
+        source = "最初の景色です。次の説明です！\n最後の一言です"
+        expected = ["最初の景色です。", "次の説明です！", "最後の一言です"]
+        def chat(endpoint, payload, key):
+            targets = json.loads(payload["messages"][1]["content"])["targets"]
+            self.assertEqual([target["source"] for target in targets], expected)
+            self.assertTrue(all(target["full_source"] == source for target in targets))
+            rows = [{"id": target["id"], "text": f"第{index}段"} for index, target in enumerate(targets, 1)]
+            return {"message": {"content": json.dumps({"translations": rows[::-1]})}}
+        with patch("yutonight.pipeline._chat", side_effect=chat):
+            result = translate_cues([Cue("cue", 1, 2, source)], "ollama", "test")
+        self.assertEqual(result[0].translation, "第1段 第2段 第3段")
+
+    def test_one_cue_over_twelve_fragments_batches_and_rejoins(self):
+        source = "".join(f"場面{i:02d}の説明を続けます。" for i in range(13))
+        cues = [Cue("original-id", 2.5, 17.25, source, "旧译文")]
+        batches = []
+        def chat(endpoint, payload, key):
+            targets = json.loads(payload["messages"][1]["content"])["targets"]
+            batches.append(targets)
+            self.assertTrue(all(target["full_source"] == source for target in targets))
+            rows = [{"id": target["id"], "text": f"译{int(target['id']):02d}"} for target in targets]
+            return {"message": {"content": json.dumps({"translations": rows})}}
+        with patch("yutonight.pipeline._chat", side_effect=chat):
+            result = translate_cues(cues, "ollama", "test")
+        self.assertEqual([len(batch) for batch in batches], [12, 1])
+        self.assertEqual([target["id"] for batch in batches for target in batch], [str(i) for i in range(13)])
+        self.assertEqual([target["source"] for batch in batches for target in batch],
+                         [f"場面{i:02d}の説明を続けます。" for i in range(13)])
+        self.assertEqual(result[0].translation, " ".join(f"译{i:02d}" for i in range(13)))
+        self.assertEqual((result[0].id, result[0].start, result[0].end, result[0].source),
+                         ("original-id", 2.5, 17.25, source))
+        self.assertEqual(cues[0].translation, "旧译文")
+
+    def test_missing_fragment_in_second_batch_keeps_original_cue(self):
+        source = "".join(f"場面{i:02d}の説明を続けます。" for i in range(13))
+        cues = [Cue("original-id", 2.5, 17.25, source, "旧译文")]
+        batches = []
+        def chat(endpoint, payload, key):
+            targets = json.loads(payload["messages"][1]["content"])["targets"]
+            batches.append(targets)
+            rows = [{"id": target["id"], "text": "译文"} for target in targets]
+            if len(batches) == 2:
+                rows = []
+            return {"message": {"content": json.dumps({"translations": rows})}}
+        with patch("yutonight.pipeline._chat", side_effect=chat), self.assertRaises(PipelineError):
+            translate_cues(cues, "ollama", "test")
+        self.assertEqual([len(batch) for batch in batches], [12, 1])
+        self.assertEqual((cues[0].id, cues[0].start, cues[0].end, cues[0].source, cues[0].translation),
+                         ("original-id", 2.5, 17.25, source, "旧译文"))
+
     def test_http_errors_do_not_expose_body_and_redirects_not_followed(self):
         hits = []
         class Handler(BaseHTTPRequestHandler):
